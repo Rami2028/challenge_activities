@@ -1,4 +1,6 @@
-# Define provider
+
+
+ # Define provider
 provider "aws" {
   region = "us-west-2"  # Update with your desired region
 }
@@ -119,62 +121,121 @@ data "aws_ami" "latest_amazon_linux" {
 
 # Create EC2 instance with WordPress in public subnet AZ1
 resource "aws_instance" "wordpress_instance" {
-  ami           = data.aws_ami.latest_amazon_linux.id  # Replace with your desired AMI ID
-  instance_type = "t2.micro"                # Replace with your desired instance type
+  ami           = data.aws_ami.latest_amazon_linux.id
+  instance_type = "t2.micro"
   vpc_security_group_ids = [aws_security_group.devVPC_sg_allow_ssh_http.id]
   subnet_id     = aws_subnet.public_subnet_az1.id
+
+  # Tags for the EC2 instance
   tags = {
-        Name = "terraform15_ec2_for_public_subnet1_az1"
-    }
-key_name               = "vockey"
-  user_data = <<-EOF
-              #!/bin/bash
+    Name = "terraform15_ec2_for_public_subnet1_az1"
+  }
 
-# System-Update
-sudo yum update -y
-
-# Installation von Apache, MariaDB, PHP und zusätzlichen Paketen
-sudo yum install -y httpd mariadb-server php php-mysqlnd unzip
-
-# EPEL und Remi Repository für PHP 7.4 hinzufügen
-sudo amazon-linux-extras install epel
-sudo yum install https://rpms.remirepo.net/enterprise/remi-release-8.rpm
-
-# PHP 7.4 aktivieren und benötigte PHP-Pakete installieren
-sudo amazon-linux-extras enable php7.4
-sudo yum clean metadata
-sudo yum install php-cli php-pdo php-fpm php-json php-mysqlnd php php-{mbstring,json,xml,mysqlnd}
-
-# Starten und Aktivieren von Apache und MariaDB
-sudo systemctl start httpd
-sudo systemctl enable httpd
-sudo systemctl start mariadb
-sudo systemctl enable mariadb
-# WordPress herunterladen und konfigurieren
-cd /var/www/html
-sudo curl -LO https://wordpress.org/latest.zip
-sudo unzip latest.zip
-sudo mv -f wordpress/* ./
-sudo rm -rf wordpress latest.zip
-sudo chown -R apache:apache /var/www/html
-
-# Konfiguration von MariaDB für WordPress
-sudo mysql -e "CREATE DATABASE wordpress;"
-sudo mysql -e "CREATE USER 'wpuser'@'localhost' IDENTIFIED BY 'wppassword';"
-sudo mysql -e "GRANT ALL PRIVILEGES ON wordpress.* TO 'wpuser'@'localhost';"
-sudo mysql -e "FLUSH PRIVILEGES;"
-
-sudo yum update -y
-
-# Neustart von Apache um alle Änderungen zu übernehmen
-sudo systemctl restart httpd
-
-# Überprüfung der PHP-Version
-php -v
-sudo yum update -y
-              EOF
-
- 
+  key_name  = "vockey"
+  user_data = file("userdata.sh")  # Replace "userdata.sh" with the name of your user data file.
 }
 
 
+
+
+
+
+resource "aws_lb" "wordpress_lb" {
+  name               = "wordpress-lb"
+  subnets            = [aws_subnet.public_subnet_az1.id, aws_subnet.public_subnet_az2.id]
+  security_groups = [aws_security_group.load_balancer_sg.id]
+  # Replace with the security group for the load balancer
+
+  tags = {
+    Name = "wordpress-lb"
+  }
+}
+resource "aws_security_group" "load_balancer_sg" {
+  name_prefix = "load-balancer-sg-"
+
+  vpc_id = aws_vpc.sandbox_vpc.id
+
+  ingress {
+    description = "Allow HTTP from anywhere"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # You can add more ingress or egress rules as per your requirements
+}
+
+
+resource "aws_lb_target_group" "wordpress_target_group" {
+  name        = "wordpress-target-group"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.sandbox_vpc.id
+
+  health_check {
+    path                = "/"
+    protocol            = "HTTP"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    matcher             = "200-299"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "wordpress_attachment_az1" {
+  target_group_arn = aws_lb_target_group.wordpress_target_group.arn
+  target_id        = aws_instance.wordpress_instance.id
+  port             = 80
+}
+
+
+resource "aws_lb_listener" "wordpress_listener" {
+  load_balancer_arn = aws_lb.wordpress_lb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wordpress_target_group.arn
+  }
+}
+
+
+resource "aws_autoscaling_group" "wordpress_asg" {
+  name        = "wordpress-asg"
+  min_size    = 1
+  max_size    = 3
+  desired_capacity = 2
+  health_check_grace_period = 300
+
+  mixed_instances_policy {
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.wordpress_lt.id
+        version            = "$Latest"
+      }
+
+      override {
+        instance_type     = "t2.micro"  # You can change this instance type as needed
+        weighted_capacity = "1"
+      }
+    }
+  }
+
+  vpc_zone_identifier = [aws_subnet.public_subnet_az1.id, aws_subnet.public_subnet_az2.id]
+
+  # Associate the Auto Scaling group with the load balancer target group
+  target_group_arns = [aws_lb_target_group.wordpress_target_group.arn]
+}
+
+resource "aws_launch_template" "wordpress_lt" {
+  name_prefix = "wordpress-lt-"
+
+  image_id           = data.aws_ami.latest_amazon_linux.id
+  instance_type      = "t2.micro"  # Change this instance type as needed
+  vpc_security_group_ids = [aws_security_group.devVPC_sg_allow_ssh_http.id]
+  key_name           = "vockey"
+
+}
